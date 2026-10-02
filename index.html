@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eye Tracking Alert System</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: #1e1e24; color: #fff; display: flex;
+      align-items: center; justify-content: center; min-height: 100vh;
+      margin: 0; padding: 20px;
+    }
+    .container {
+      width: min(100%, 560px); text-align: center; background: #2a2a35;
+      padding: 25px; border-radius: 12px; box-shadow: 0 8px 24px #0005;
+    }
+    #video-container {
+      position: relative; width: 100%; aspect-ratio: 4 / 3;
+      background: #000; border-radius: 8px; overflow: hidden; margin: 20px 0;
+    }
+    video, canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    button {
+      background: #4f46e5; color: white; border: 0; padding: 12px 24px;
+      font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer;
+    }
+    button:hover { background: #4338ca; }
+    button:disabled { background: #6b7280; cursor: not-allowed; }
+    #status { font-size: 18px; font-weight: 600; margin-top: 10px; color: #34d399; }
+    .alert { color: #f87171 !important; animation: blink 1s infinite; }
+    .muted { color: #cbd5e1; font-size: 14px; }
+    @keyframes blink { 50% { opacity: .5; } }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h2>Eye Tracking Alert System</h2>
+    <p class="muted">Keep this page open while tracking. Camera access requires HTTPS or localhost.</p>
+    <button id="startButton" disabled>Loading AI model…</button>
+    <div id="video-container">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="output_canvas" width="480" height="360"></canvas>
+    </div>
+    <div id="status" role="status" aria-live="polite">Loading AI model…</div>
+  </main>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("output_canvas");
+    const ctx = canvas.getContext("2d");
+    const startButton = document.getElementById("startButton");
+    const statusDiv = document.getElementById("status");
+
+    let faceLandmarker;
+    let stream;
+    let animationId = null;
+    let audioCtx = null;
+    let lastVideoTime = -1;
+    let eyesClosedStartTime = null;
+    let lastBeepTime = 0;
+
+    // Blendshape scores range from 0 (not present) to 1 (strongly present).
+    const EYE_CLOSED_THRESHOLD = 0.55;
+    const TIME_REQUIRED_MS = 800;
+    const BEEP_INTERVAL_MS = 900;
+
+    async function initializeFaceLandmarker() {
+      try {
+        statusDiv.textContent = "Loading AI model…";
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU"
+          },
+          outputFaceBlendshapes: true,
+          runningMode: "VIDEO",
+          numFaces: 1
+        });
+        statusDiv.textContent = "Model ready. Click Start Tracking.";
+        startButton.textContent = "Start Tracking";
+        startButton.disabled = false;
+      } catch (error) {
+        console.error("Model initialization failed:", error);
+        statusDiv.textContent = "Could not load the AI model. Check your internet connection and reload.";
+        startButton.textContent = "Model failed to load";
+      }
+    }
+
+    function initAudio() {
+      if (!audioCtx) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) audioCtx = new AudioContextClass();
+      }
+      if (audioCtx?.state === "suspended") audioCtx.resume();
+    }
+
+    function playBeep() {
+      if (!audioCtx || audioCtx.state !== "running") return;
+      const now = audioCtx.currentTime;
+      const oscillator = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(880, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.35, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+      oscillator.connect(gain);
+      gain.connect(audioCtx.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.36);
+    }
+
+    function setStatus(message, alert = false) {
+      statusDiv.textContent = message;
+      statusDiv.classList.toggle("alert", alert);
+    }
+
+    async function startTracking() {
+      startButton.disabled = true;
+      initAudio();
+      setStatus("Accessing webcam…");
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Camera access requires HTTPS or localhost.");
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { width: { ideal: 480 }, height: { ideal: 360 }, facingMode: "user" }
+        });
+        video.srcObject = stream;
+        await video.play();
+        eyesClosedStartTime = null;
+        lastVideoTime = -1;
+        lastBeepTime = 0;
+        setStatus("Tracking active: eyes open");
+        startButton.textContent = "Stop Tracking";
+        startButton.disabled = false;
+        startButton.onclick = stopTracking;
+        animationId = requestAnimationFrame(predictWebcam);
+      } catch (error) {
+        console.error("Webcam error:", error);
+        setStatus("Camera error: " + error.message);
+        startButton.textContent = "Try Again";
+        startButton.disabled = false;
+        startButton.onclick = startTracking;
+      }
+    }
+
+    function stopTracking() {
+      if (animationId !== null) cancelAnimationFrame(animationId);
+      animationId = null;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      video.srcObject = null;
+      eyesClosedStartTime = null;
+      lastVideoTime = -1;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      startButton.textContent = "Start Tracking";
+      startButton.disabled = false;
+      startButton.onclick = startTracking;
+      setStatus("Tracking stopped.");
+    }
+
+    async function predictWebcam() {
+      if (!stream || !faceLandmarker) return;
+      if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        try {
+          const results = faceLandmarker.detectForVideo(video, performance.now());
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          const categories = results.faceBlendshapes?.[0]?.categories;
+          if (categories) {
+            const left = categories.find(item => item.categoryName === "eyeBlinkLeft")?.score ?? 0;
+            const right = categories.find(item => item.categoryName === "eyeBlinkRight")?.score ?? 0;
+            const blinkAverage = (left + right) / 2;
+
+            if (blinkAverage >= EYE_CLOSED_THRESHOLD) {
+              if (eyesClosedStartTime === null) eyesClosedStartTime = performance.now();
+              if (performance.now() - eyesClosedStartTime >= TIME_REQUIRED_MS) {
+                setStatus("⚠️ Possible drowsiness detected — wake up!", true);
+                if (performance.now() - lastBeepTime >= BEEP_INTERVAL_MS) {
+                  playBeep();
+                  lastBeepTime = performance.now();
+                }
+              } else {
+                setStatus("Eyes closed — monitoring…");
+              }
+            } else {
+              eyesClosedStartTime = null;
+              setStatus("Tracking active: eyes open");
+            }
+          } else {
+            eyesClosedStartTime = null;
+            setStatus("Face not detected");
+          }
+        } catch (error) {
+          console.error("Tracking error:", error);
+          setStatus("Tracking error. Please stop and restart.");
+        }
+      }
+      animationId = requestAnimationFrame(predictWebcam);
+    }
+
+    startButton.onclick = startTracking;       initializeFaceLandmarker();
+  </script>
+</body>
+</html>
